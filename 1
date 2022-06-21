@@ -1,0 +1,185 @@
+using System;
+using System.Linq;
+using cAlgo.API;
+using cAlgo.API.Indicators;
+using cAlgo.API.Internals;
+using cAlgo.Indicators;
+
+namespace cAlgo.Robots
+{
+
+    [Robot(TimeZone = TimeZones.WCentralAfricaStandardTime, AccessRights = AccessRights.None)]
+    public class _OFX_CBOT_200620221354_SSL_ICHI : Robot
+    {
+        [Parameter("Volume", DefaultValue = 1000)]
+        public double _Volume { get; set; }
+        [Parameter("Length", DefaultValue = 26)]
+        public int _length { get; set; }
+        [Parameter("MA Type", DefaultValue = MovingAverageType.Weighted)]
+        public MovingAverageType _MAType { get; set; }
+        [Parameter("Instance Name", DefaultValue = "OrglobalFxSSL")]
+        public string InstanceName { get; set; }
+
+        // Breakeven parameters
+        [Parameter("Include Break-Even", DefaultValue = true, Group = "Protection")]
+        public bool IncludeBreakEven { get; set; }
+        [Parameter("Trail after Break-Even", DefaultValue = true, Group = "Protection")]
+        public bool Includetrail { get; set; }
+
+        private SSLChannel _ssl;
+        private IchimokuKinkoHyo _ichi;
+        private AverageTrueRange _atr;
+        public double StopLossInPips, BreakEvenPips, trailingstoppips, TakeProfitInPips, BreakEvenExtraPips;
+
+        protected override void OnStart()
+        {
+            _ssl = Indicators.GetIndicator<SSLChannel>(_length, _MAType);
+            _ichi = Indicators.IchimokuKinkoHyo(9, 26, 52);
+            InstanceName = InstanceName + "_" + SymbolName;
+            _atr = Indicators.AverageTrueRange(52, MovingAverageType.Simple);
+
+        }
+
+        protected override void OnBar()
+        {
+            //TakeProfitInPips = Math.Round((_atr.Result.LastValue / Symbol.PipSize), 0);
+            StopLossInPips = Math.Round((_atr.Result.LastValue / Symbol.PipSize), 0);
+            var chiku = _ichi.ChikouSpan;
+            var sekuA = _ichi.SenkouSpanA;
+            var sekuB = _ichi.SenkouSpanB;
+//Kumo cloud            
+            var cloudupper = Math.Max(sekuA.Last(26), sekuB.Last(26));
+            var cloudlower = Math.Min(sekuA.Last(26), sekuB.Last(26));
+            var sslupper = Math.Max(_ssl._sslUp.Last(1), _ssl._sslDown.Last(1));
+            var ssllower = Math.Min(_ssl._sslUp.Last(1), _ssl._sslDown.Last(1));
+
+            //Chiku spann above /below price 26 bars behind            
+            var longchikuprice = chiku.Last(1) > Bars.HighPrices.Last(26);
+            var shortchikuprice = chiku.Last(1) < Bars.LowPrices.Last(26);
+
+            var price = Bars.ClosePrices;
+//_ssl._sslUp.HasCrossedAbove(_ssl._sslDown, 1)
+            if (_ssl._sslUp.Last(1) > _ssl._sslDown.Last(1) & price.Last(1) > sslupper & ssllower > cloudupper && longchikuprice)
+            {
+
+                Open(TradeType.Buy, InstanceName);
+            }
+//_ssl._sslUp.HasCrossedBelow(_ssl._sslDown, 1)            
+            else if (_ssl._sslUp.Last(1) < _ssl._sslDown.Last(1) & price.Last(1) < ssllower & sslupper < cloudlower && shortchikuprice)
+            {
+
+                Open(TradeType.Sell, InstanceName);
+            }
+
+
+            //Close Buy Position when the top ssl line has crossed below the bottom line in the last 1 bar or in the current bar
+            if (_ssl._sslUp.HasCrossedBelow(_ssl._sslDown, 0) || _ssl._sslUp.HasCrossedBelow(_ssl._sslDown, 1) || chiku.Last(1) < Bars.ClosePrices.Last(26))
+            {
+                Close(TradeType.Buy, InstanceName);
+            }
+//Close Sell Position  when the top ssl line has crossed below the above line in the last 1 bar or in the current bar
+            if (_ssl._sslUp.HasCrossedAbove(_ssl._sslDown, 0) || _ssl._sslUp.HasCrossedAbove(_ssl._sslDown, 1) || chiku.Last(1) > Bars.ClosePrices.Last(26))
+            {
+                Close(TradeType.Sell, InstanceName);
+            }
+
+
+            //Breakeven Function Usecase
+            if (IncludeBreakEven)
+            {
+                BreakEvenAdjustment();
+            }
+        }
+
+        private void Close(TradeType tradeType, string Label)
+        {
+            foreach (var position in Positions.FindAll(Label, SymbolName, tradeType))
+                ClosePosition(position);
+        }
+
+        private void Open(TradeType tradeType, string Label)
+        {
+            var position = Positions.Find(Label, SymbolName);
+            if (position == null)
+            {
+                ExecuteMarketOrder(tradeType, SymbolName, _Volume, InstanceName, StopLossInPips, TakeProfitInPips);
+                //ExecuteMarketOrder(tradeType, SymbolName, _Volume / 2, InstanceName, StopLossInPips, null);
+            }
+        }
+
+        #region Break Even
+// code from clickalgo.com
+        private void BreakEvenAdjustment()
+        {
+            var positn = Positions.Find(InstanceName, SymbolName);
+            var allPositions = Positions.FindAll(InstanceName, SymbolName);
+
+            foreach (Position position in allPositions)
+            {
+                var entryPrice = position.EntryPrice;
+                var distance = position.TradeType == TradeType.Buy ? Symbol.Bid - entryPrice : entryPrice - Symbol.Ask;
+
+//Breakeven @ takeprofit                
+                BreakEvenPips = Math.Round((_atr.Result.LastValue / Symbol.PipSize), 0);
+
+//Trailing stop is triggered when winning pips equals the 3 times the takeprofit pips                
+                trailingstoppips = BreakEvenPips * 3;
+                BreakEvenExtraPips = BreakEvenPips / 2;
+
+
+
+// move stop loss to break even plus and additional (x) pips
+                if (distance >= BreakEvenPips * Symbol.PipSize)
+                {
+                    if (position.TradeType == TradeType.Buy)
+                    {
+                        if (position.StopLoss <= position.EntryPrice + (Symbol.PipSize * BreakEvenExtraPips) || position.StopLoss == null)
+                        {
+                            // && position.Pips >= trailingstoppips)
+                            if (Includetrail)
+                            {
+                                //ModifyPosition(position, position.EntryPrice);
+                                position.ModifyStopLossPrice(position.EntryPrice + (Symbol.PipSize * BreakEvenExtraPips));
+                                Print("Stop Loss to Break Even set for BUY position {0}", position.Id);
+
+                                if (position.Pips >= trailingstoppips)
+                                    position.ModifyTrailingStop(true);
+
+                            }
+                            else if (!Includetrail)
+                            {
+                                //ModifyPosition(position, position.EntryPrice + (Symbol.PipSize * BreakEvenExtraPips), position.TakeProfit);
+                                position.ModifyStopLossPrice(position.EntryPrice + (Symbol.PipSize * BreakEvenExtraPips));
+                                Print("Stop Loss to Break Even set for BUY position {0}", position.Id);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (position.StopLoss >= position.EntryPrice - (Symbol.PipSize * BreakEvenExtraPips) || position.StopLoss == null)
+                        {
+                            // && position.Pips >= trailingstoppips)
+                            if (Includetrail)
+                            {
+                                ModifyPosition(position, entryPrice - (Symbol.PipSize * BreakEvenExtraPips), position.TakeProfit);
+                                Print("Stop Loss to Break Even set for SELL position {0}", position.Id);
+
+                                if (position.Pips >= trailingstoppips)
+                                    position.ModifyTrailingStop(true);
+                            }
+                            else if (!Includetrail)
+                            {
+                                ModifyPosition(position, entryPrice - (Symbol.PipSize * BreakEvenExtraPips), position.TakeProfit);
+                                Print("Stop Loss to Break Even set for SELL position {0}", position.Id);
+
+                            }
+                        }
+                    }
+
+                }
+            }
+        }
+
+        #endregion
+    }
+}
